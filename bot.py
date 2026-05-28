@@ -36,6 +36,7 @@ user_states = {}
 admin_selected_worker = {}
 
 async def init_db():
+
     async with aiosqlite.connect(DB_NAME) as db:
 
         await db.execute("""
@@ -67,7 +68,27 @@ async def init_db():
         )
         """)
 
-        await db.commit()
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE
+        )
+        """)
+
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO admins (
+                telegram_id
+            )
+            VALUES (?)
+            """,
+            (ADMIN_ID,),
+        )
+
+        await db.commit()  
+
+    
+   
 
 
 main_keyboard = ReplyKeyboardMarkup(
@@ -107,12 +128,15 @@ admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="👥 Активні працівники")],
         [KeyboardButton(text="📈 Статистика працівника")],
+        [KeyboardButton(text="➕ Додати адміна")],
     ],
     resize_keyboard=True,
 )
 
 
 async def get_active_process(user_id):
+
+    
 
     async with aiosqlite.connect(DB_NAME) as db:
 
@@ -129,6 +153,23 @@ async def get_active_process(user_id):
         )
 
         return await cursor.fetchone()
+    
+async def is_admin(user_id):
+
+    async with aiosqlite.connect(DB_NAME) as db:
+
+        cursor = await db.execute(
+            """
+            SELECT telegram_id
+            FROM admins
+            WHERE telegram_id = ?
+            """,
+            (user_id,),
+        )
+
+        admin = await cursor.fetchone()
+
+    return admin is not None
 
 
 @dp.message(CommandStart())
@@ -146,7 +187,7 @@ async def start(message: Message):
         f"Ласкаво просимо у систему обліку afon"
     )
 
-    if message.from_user.id == ADMIN_ID:
+    if await is_admin(message.from_user.id):
         await message.answer(text, reply_markup=admin_keyboard)
     else:
         await message.answer(text, reply_markup=main_keyboard)
@@ -254,21 +295,26 @@ async def stats(message: Message):
 
     for date, processes in grouped.items():
 
-        text += f"📅 <b>{date}</b>\n"
+            text_message += f"📅 <b>{date}</b>\n"
 
-        for process in processes:
-            text += f"{process}\n"
+            for process in processes:
+                text_message += process + "\n"
 
-        text += "\n"
+            text_message += "\n"
 
-    await message.answer(text)
+    await message.answer(
+            text_message,
+            reply_markup=period_keyboard,
+        )
+
+    return
 
 
 @dp.message(F.text == "👥 Активні працівники")
 async def admin_active(message: Message):
 
-    if message.from_user.id != ADMIN_ID:
-        return
+    if not await is_admin(message.from_user.id):
+     return
 
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
@@ -304,8 +350,8 @@ async def admin_active(message: Message):
 @dp.message(F.text == "📈 Статистика працівника")
 async def choose_worker(message: Message):
 
-    if message.from_user.id != ADMIN_ID:
-        return
+    if not await is_admin(message.from_user.id):
+     return
 
     async with aiosqlite.connect(DB_NAME) as db:
 
@@ -337,43 +383,49 @@ async def choose_worker(message: Message):
 
     await message.answer(text)
 
-@dp.message(F.text == "📅 Історія за місяць")
-async def admin_history(message: Message):
+@dp.message(F.text == "➕ Додати адміна")
+async def add_admin_start(message: Message):
 
     if message.from_user.id != ADMIN_ID:
         return
 
     async with aiosqlite.connect(DB_NAME) as db:
+
         cursor = await db.execute(
             """
-            SELECT full_name,
-                   process_name,
-                   amount,
-                   date
-            FROM history
-            ORDER BY id DESC
-            LIMIT 100
+            SELECT telegram_id, full_name
+            FROM workers
+            ORDER BY full_name
             """
         )
 
-        rows = await cursor.fetchall()
+        workers = await cursor.fetchall()
 
-    if not rows:
-        await message.answer("❌ Історія порожня")
+    if not workers:
+
+        await message.answer(
+            "❌ Працівників не знайдено"
+        )
+
         return
 
-    text = "📅 <b>Історія:</b>\n\n"
+    text = "👤 <b>Вибери працівника:</b>\n\n"
 
-    for row in rows:
+    for index, worker in enumerate(workers, start=1):
+
         text += (
-            f"👤 {row[0]}\n"
-            f"📌 {row[1]}\n"
-            f"🔢 {row[2]} шт\n"
-            f"📆 {row[3]}\n\n"
+            f"{index}. {worker[1]}\n"
         )
+
+    text += "\n✍️ Напиши номер працівника"
+
+    admin_selected_worker["admin_workers"] = workers
+
+    user_states[message.from_user.id] = "add_admin"
 
     await message.answer(text)
 
+   
 
 @dp.message()
 async def all_messages(message: Message):
@@ -430,6 +482,68 @@ async def all_messages(message: Message):
 
         return
 
+
+
+    # ------------------------
+    # Додавання адміна
+    # ------------------------
+
+    if (
+        user_states.get(user_id) == "add_admin"
+        and user_id == ADMIN_ID
+    ):
+
+        workers = admin_selected_worker.get(
+            "admin_workers",
+            []
+        )
+
+        if not text.isdigit():
+
+            await message.answer(
+                "❌ Введи номер працівника"
+            )
+
+            return
+
+        number = int(text)
+
+        if number < 1 or number > len(workers):
+
+            await message.answer(
+                "❌ Працівника не знайдено"
+            )
+
+            return
+
+        selected_worker = workers[number - 1]
+
+        worker_id = selected_worker[0]
+        worker_name = selected_worker[1]
+
+        async with aiosqlite.connect(DB_NAME) as db:
+
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO admins (
+                    telegram_id
+                )
+                VALUES (?)
+                """,
+                (worker_id,),
+            )
+
+            await db.commit()
+
+        user_states.pop(user_id, None)
+
+        await message.answer(
+            f"✅ {worker_name} тепер адмін",
+            reply_markup=admin_keyboard,
+        )
+
+        return
+    
 
     # ------------------------
     # Вибір працівника адміном
