@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
@@ -12,6 +12,10 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 TOKEN = "8650993073:AAGuX5PAE9idWp9RDHGbYCOO8RU-LDuIdmQ"
 ADMIN_ID = 755891182
@@ -29,7 +33,7 @@ logging.basicConfig(level=logging.INFO)
 DB_NAME = "database.db"
 
 user_states = {}
-
+admin_selected_worker = {}
 
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
@@ -67,9 +71,21 @@ async def init_db():
 
 
 main_keyboard = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="▶️ Почати день")],
+    keyboard=[
+        [KeyboardButton(text="▶️ Почати день")],
         [KeyboardButton(text="📂 Мої процеси")],
         [KeyboardButton(text="📊 Моя статистика")],
+    ],
+    resize_keyboard=True,
+)
+
+period_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📅 Сьогодні")],
+        [KeyboardButton(text="📆 Тиждень")],
+        [KeyboardButton(text="🗓 Місяць")],
+        [KeyboardButton(text="📊 3 Місяці")],
+        [KeyboardButton(text="⬅️ Назад")],
     ],
     resize_keyboard=True,
 )
@@ -86,22 +102,26 @@ counter_keyboard = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+
 admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="👥 Активні працівники")],
-        [KeyboardButton(text="📅 Історія за місяць")],
+        [KeyboardButton(text="📈 Статистика працівника")],
     ],
     resize_keyboard=True,
 )
 
 
 async def get_active_process(user_id):
+
     async with aiosqlite.connect(DB_NAME) as db:
+
         cursor = await db.execute(
             """
             SELECT process_name, amount
             FROM processes
-            WHERE telegram_id = ? AND active = 1
+            WHERE telegram_id = ?
+            AND active = 1
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -144,17 +164,25 @@ async def start_day(message: Message):
         "• Пайка"
     )
 
+@dp.message(F.text == "🔄 Змінити процес")
+async def change_process(message: Message):
+
+    user_states[message.from_user.id] = "switch_process"
+
+    await my_processes(message)
+
 
 @dp.message(F.text == "📂 Мої процеси")
 async def my_processes(message: Message):
 
     async with aiosqlite.connect(DB_NAME) as db:
+
         cursor = await db.execute(
             """
-            SELECT process_name, amount
+            SELECT id, process_name, amount, active
             FROM processes
             WHERE telegram_id = ?
-            ORDER BY id DESC
+            ORDER BY id ASC
             """,
             (message.from_user.id,),
         )
@@ -167,10 +195,19 @@ async def my_processes(message: Message):
 
     text = "📂 <b>Твої процеси:</b>\n\n"
 
-    for process in processes:
-        text += f"📌 {process[0]} — {process[1]} шт\n"
+    for index, process in enumerate(processes, start=1):
 
-    text += "\nНапиши назву процесу щоб переключитися на нього"
+        status = "🟢" if process[3] == 1 else "⚪"
+
+        text += (
+            f"{status} <b>{index}.</b> {process[1]}\n"
+            f"🔢 {process[2]} шт\n\n"
+        )
+
+    text += (
+        "✍️ Напиши номер процесу для переключення\n"
+        "або введи нову назву для створення нового процесу"
+    )
 
     user_states[message.from_user.id] = "switch_process"
 
@@ -181,11 +218,13 @@ async def my_processes(message: Message):
 async def stats(message: Message):
 
     async with aiosqlite.connect(DB_NAME) as db:
+
         cursor = await db.execute(
             """
-            SELECT process_name, amount
-            FROM processes
+            SELECT process_name, amount, date
+            FROM history
             WHERE telegram_id = ?
+            ORDER BY id DESC
             """,
             (message.from_user.id,),
         )
@@ -196,14 +235,31 @@ async def stats(message: Message):
         await message.answer("❌ Статистика порожня")
         return
 
-    total = sum(row[1] for row in rows)
+    grouped = {}
+
+    for row in rows:
+
+        process_name = row[0]
+        amount = row[1]
+        date = row[2]
+
+        if date not in grouped:
+            grouped[date] = []
+
+        grouped[date].append(
+            f"📌 {process_name} — {amount} шт"
+        )
 
     text = "📊 <b>Твоя статистика:</b>\n\n"
 
-    for row in rows:
-        text += f"📌 {row[0]} — {row[1]}\n"
+    for date, processes in grouped.items():
 
-    text += f"\n🔢 Загалом: <b>{total}</b>"
+        text += f"📅 <b>{date}</b>\n"
+
+        for process in processes:
+            text += f"{process}\n"
+
+        text += "\n"
 
     await message.answer(text)
 
@@ -244,6 +300,42 @@ async def admin_active(message: Message):
 
     await message.answer(text)
 
+
+@dp.message(F.text == "📈 Статистика працівника")
+async def choose_worker(message: Message):
+
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+
+        cursor = await db.execute(
+            """
+            SELECT DISTINCT full_name
+            FROM workers
+            ORDER BY full_name
+            """
+        )
+
+        workers = await cursor.fetchall()
+
+    if not workers:
+        await message.answer("❌ Працівників не знайдено")
+        return
+
+    text = "👤 <b>Вибери працівника:</b>\n\n"
+
+    for index, worker in enumerate(workers, start=1):
+
+        text += f"{index}. {worker[0]}\n"
+
+    text += "\n✍️ Напиши номер працівника"
+
+    admin_selected_worker["workers"] = workers
+
+    user_states[message.from_user.id] = "choose_worker"
+
+    await message.answer(text)
 
 @dp.message(F.text == "📅 Історія за місяць")
 async def admin_history(message: Message):
@@ -289,9 +381,23 @@ async def all_messages(message: Message):
     user_id = message.from_user.id
     text = message.text
 
+    # ------------------------
+    # Створення нового процесу
+    # ------------------------
+
     if user_states.get(user_id) == "waiting_process":
 
         async with aiosqlite.connect(DB_NAME) as db:
+
+            await db.execute(
+                """
+                UPDATE processes
+                SET active = 0
+                WHERE telegram_id = ?
+                """,
+                (user_id,),
+            )
+
             await db.execute(
                 """
                 INSERT INTO processes (
@@ -312,26 +418,9 @@ async def all_messages(message: Message):
                 ),
             )
 
-            await db.execute(
-                "UPDATE processes SET active = 0 WHERE telegram_id = ?",
-                (user_id,),
-            )
-
-            await db.execute(
-                """
-                UPDATE processes
-                SET active = 1
-                WHERE id = (
-                    SELECT MAX(id)
-                    FROM processes
-                    WHERE telegram_id = ?
-                )
-                """,
-                (user_id,),
-            )
-
             await db.commit()
-            user_states.pop(user_id)
+
+        user_states.pop(user_id)
 
         await message.answer(
             f"✅ Процес <b>{text}</b> створено\n\n"
@@ -341,57 +430,371 @@ async def all_messages(message: Message):
 
         return
 
+
+    # ------------------------
+    # Вибір працівника адміном
+    # ------------------------
+
+    if (
+        user_states.get(user_id) == "choose_worker"
+        and user_id == ADMIN_ID
+    ):
+
+        workers = admin_selected_worker.get("workers", [])
+
+        if not text.isdigit():
+
+            await message.answer(
+                "❌ Введи номер працівника"
+            )
+
+            return
+
+        number = int(text)
+
+        if number < 1 or number > len(workers):
+
+            text_message = (
+                "❌ Працівника не знайдено\n\n"
+                "👤 <b>Список працівників:</b>\n\n"
+            )
+
+            for index, worker in enumerate(workers, start=1):
+
+                text_message += f"{index}. {worker[0]}\n"
+
+            text_message += "\n✍️ Напиши номер працівника"
+
+            await message.answer(text_message)
+
+            return
+
+        worker_name = workers[number - 1][0]
+
+        admin_selected_worker[user_id] = worker_name
+
+        user_states[user_id] = "choose_period"
+
+        await message.answer(
+            f"👤 Працівник: <b>{worker_name}</b>\n\n"
+            f"📅 Вибери період:",
+            reply_markup=period_keyboard,
+        )
+
+        return
+    
+    # ------------------------
+    # Статистика працівника
+    # ------------------------
+
+    if (
+        user_states.get(user_id) == "choose_period"
+        and user_id == ADMIN_ID
+    ):
+
+        worker_name = admin_selected_worker.get(user_id)
+
+        if not worker_name:
+            return
+
+        days = 1
+
+        if text == "📅 Сьогодні":
+            days = 1
+
+        elif text == "📆 Тиждень":
+            days = 7
+
+        elif text == "🗓 Місяць":
+            days = 30
+
+        elif text == "📊 3 Місяці":
+            days = 90
+
+        elif text == "⬅️ Назад":
+
+            user_states.pop(user_id, None)
+
+            await message.answer(
+                "🔙 Повернення в адмін меню",
+                reply_markup=admin_keyboard,
+            )
+
+            return
+
+        else:
+            return
+
+        start_date = (
+            datetime.now() - timedelta(days=days)
+        ).strftime("%d.%m.%Y")
+
+        async with aiosqlite.connect(DB_NAME) as db:
+
+            cursor = await db.execute(
+                """
+                SELECT history.date,
+                       history.process_name,
+                       history.amount
+                FROM history
+                JOIN workers
+                ON workers.telegram_id = history.telegram_id
+                WHERE workers.full_name = ?
+                ORDER BY history.id DESC
+                """,
+                (worker_name,),
+            )
+
+            rows = await cursor.fetchall()
+
+        filtered_rows = []
+
+        now = datetime.now()
+
+        for row in rows:
+
+            row_date = row[0]
+
+            try:
+
+                row_datetime = datetime.strptime(
+                    row_date,
+                    "%d.%m.%Y"
+                )
+
+                difference = now - row_datetime
+
+                # Сьогодні
+                if days == 1:
+
+                    if difference.days == 0:
+                        filtered_rows.append(row)
+
+                # Тиждень / місяць / 3 місяці
+                else:
+
+                    if difference.days <= days:
+                        filtered_rows.append(row)
+
+            except:
+                continue
+
+        if not filtered_rows:
+
+            await message.answer(
+                "❌ За цей період статистики немає"
+            )
+
+            return
+
+        text_message = (
+            f"📈 <b>Статистика працівника</b>\n"
+            f"👤 {worker_name}\n\n"
+        )
+
+        grouped = {}
+
+        for row in filtered_rows:
+
+            date = row[0]
+            process_name = row[1]
+            amount = row[2]
+
+            if date not in grouped:
+                grouped[date] = []
+
+            grouped[date].append(
+                f"📌 {process_name} — {amount} шт"
+            )
+
+        for date, processes in grouped.items():
+
+            text_message += f"📅 <b>{date}</b>\n"
+
+            for process in processes:
+                text_message += process + "\n"
+
+            text_message += "\n"
+
+
+            await message.answer(
+               text_message,
+               reply_markup=period_keyboard,
+)
+
+        return
+    
+
+
+    # ------------------------
+    # Назад в адмін меню
+    # ------------------------
+
+    if (
+        text == "⬅️ Назад"
+        and user_id == ADMIN_ID
+    ):
+
+        user_states.pop(user_id, None)
+
+        await message.answer(
+            "🔙 Повернення в адмін меню",
+            reply_markup=admin_keyboard,
+        )
+
+        return
+    
+
+    # ------------------------
+    # Переключення процесу
+    # ------------------------
+
     if user_states.get(user_id) == "switch_process":
 
         async with aiosqlite.connect(DB_NAME) as db:
 
             cursor = await db.execute(
                 """
-                SELECT id
+                SELECT id, process_name, amount, active
                 FROM processes
                 WHERE telegram_id = ?
-                AND process_name = ?
+                ORDER BY id ASC
                 """,
-                (user_id, text),
+                (user_id,),
             )
 
-            process = await cursor.fetchone()
+            all_processes = await cursor.fetchall()
 
-            if not process:
-                await message.answer("❌ Процес не знайдено")
+            selected_process = None
+
+            # Якщо введено номер
+            if text.isdigit():
+
+                number = int(text)
+
+                if 1 <= number <= len(all_processes):
+                    selected_process = all_processes[number - 1]
+
+                else:
+
+                    text_message = "❌ Процес не знайдено\n\n"
+                    text_message += "📂 <b>Твої процеси:</b>\n\n"
+
+                    for index, process in enumerate(all_processes, start=1):
+
+                        status = "🟢" if process[3] == 1 else "⚪"
+
+                        text_message += (
+                            f"{status} <b>{index}.</b> {process[1]}\n"
+                            f"🔢 {process[2]} шт\n\n"
+                        )
+
+                    text_message += (
+                        "✍️ Напиши номер процесу\n"
+                        "або введи нову назву"
+                    )
+
+                    await message.answer(text_message)
+
+                    return
+
+            # Якщо введено назву
+            else:
+
+                for process in all_processes:
+
+                    if process[1].lower() == text.lower():
+
+                        selected_process = process
+                        break
+
+            # Якщо процес знайдено
+            if selected_process:
+
+                await db.execute(
+                    """
+                    UPDATE processes
+                    SET active = 0
+                    WHERE telegram_id = ?
+                    """,
+                    (user_id,),
+                )
+
+                await db.execute(
+                    """
+                    UPDATE processes
+                    SET active = 1
+                    WHERE id = ?
+                    """,
+                    (selected_process[0],),
+                )
+
+                await db.commit()
+
+                user_states.pop(user_id, None)
+
+                await message.answer(
+                    f"🔄 Активний процес:\n\n"
+                    f"📌 <b>{selected_process[1]}</b>\n"
+                    f"🔢 {selected_process[2]} шт",
+                    reply_markup=counter_keyboard,
+                )
+
                 return
 
+            # Якщо введено нову назву процесу
             await db.execute(
-                "UPDATE processes SET active = 0 WHERE telegram_id = ?",
+                """
+                UPDATE processes
+                SET active = 0
+                WHERE telegram_id = ?
+                """,
                 (user_id,),
             )
 
             await db.execute(
-                "UPDATE processes SET active = 1 WHERE id = ?",
-                (process[0],),
+                """
+                INSERT INTO processes (
+                    telegram_id,
+                    process_name,
+                    amount,
+                    active,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    text,
+                    0,
+                    1,
+                    str(datetime.now()),
+                ),
             )
 
             await db.commit()
 
-        user_states.pop(user_id)
+            user_states.pop(user_id, None)
 
-        active = await get_active_process(user_id)
+            await message.answer(
+                f"✅ Новий процес створено:\n\n"
+                f"📌 <b>{text}</b>\n"
+                f"🔢 0 шт",
+                reply_markup=counter_keyboard,
+            )
 
-        await message.answer(
-            f"🔄 Активний процес: <b>{active[0]}</b>\n"
-            f"🔢 Виконано: {active[1]}",
-            reply_markup=counter_keyboard,
-        )
+            return
 
-        return
+    # ------------------------
+    # Інша сума
+    # ------------------------
 
-    if text == "⬅️ Головне меню":
-        await message.answer("🏠 Головне меню", reply_markup=main_keyboard)
-        return
+   
 
-    if text == "🔄 Змінити процес":
-        await my_processes(message)
-        return
+   
+    # ------------------------
+    # Кнопки +1 +5 +10
+    # ------------------------
 
     active = await get_active_process(user_id)
 
@@ -403,12 +806,14 @@ async def all_messages(message: Message):
     if text in ["+1", "-1", "+5", "-5", "+10", "-10"]:
 
         value = int(text)
+
         new_amount = amount + value
 
         if new_amount < 0:
             new_amount = 0
 
         async with aiosqlite.connect(DB_NAME) as db:
+
             await db.execute(
                 """
                 UPDATE processes
@@ -418,16 +823,16 @@ async def all_messages(message: Message):
                 """,
                 (new_amount, user_id),
             )
+
             await db.commit()
 
         await message.answer(
-            f"📌 Процес: <b>{process_name}</b>\n"
-             f"🔢 Виконано: <b>{new_amount}</b>",
+            f"📌 {process_name}\n"
+            f"🔢 {new_amount} шт",
             reply_markup=counter_keyboard,
         )
 
         return
-
     if text == "✍️ Інша сума":
         user_states[user_id] = "custom_amount"
 
